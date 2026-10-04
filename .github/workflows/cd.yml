@@ -1,0 +1,59 @@
+# .github/workflows/cd.yml
+name: CD
+ 
+on:
+  workflow_run:
+    workflows: ["CI"]            # ชื่อต้องตรงกับ name: ใน ci.yml
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:             # กดรันเองจากหน้า Actions
+ 
+permissions:
+  contents: read
+  packages: write                # ให้ push image ขึ้น GHCR
+ 
+jobs:
+  deploy:
+    # รันเมื่อ CI ผ่านเท่านั้น (หรือกดรันเอง)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production      # ตั้ง Required reviewers ใน Settings -> Environments = ต้องกดอนุมัติก่อน deploy
+ 
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+ 
+      - run: pip install -r requirements.txt
+ 
+      - name: Preprocess data
+        id: prep
+        run: |
+          python scripts/02_data_preprocessing.py | tee prep.log
+          echo "run_id=$(grep 'Preprocessing Run ID' prep.log | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+ 
+      - name: Train, evaluate, register (@staging)
+        run: python scripts/03_train_evaluate_register.py ${{ steps.prep.outputs.run_id }} 10.0
+ 
+      - name: Promote @staging to @champion
+        run: python scripts/05_promote_model.py
+ 
+      - name: Smoke test (load by alias and predict)
+        run: python scripts/04_load_and_predict.py
+ 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+ 
+      - name: Build and push model image
+        run: |
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/wine-model:${{ github.sha }}
+          mlflow models build-docker -m "models:/wine-classifier-prod@champion" -n "$IMAGE"
+          docker push "$IMAGE"
